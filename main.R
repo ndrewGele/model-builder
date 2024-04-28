@@ -98,22 +98,28 @@ message('Getting x_data.')
 x_data <- get_all_data(db.con = db_con)
 
 # Pick a model to run, like how we picked symbols for other scripts
-models_dir <- './src/models'
-model_files <- list.files(
+models_dir <- glue::glue('{Sys.getenv("MODELS_CONTAINER")}/src')
+model_files <- list.dirs(
   path = models_dir, 
-  pattern = '.R$', 
-  full.names = TRUE
+  full.names = FALSE
 )
+model_files <- model_files[model_files != '']
 picked <- sample(x = model_files, size = 1)
 
 message(glue::glue('Picked {picked} randomly from available models.'))
 
 # Source Model Function and run it
 message('Running model function.')
-model_fun <- source(picked)$value
+model_fun <- source(glue::glue(
+  '{Sys.getenv("MODELS_CONTAINER")}/src/{picked}/{picked}.R'
+))$value
+model_y_fun <- source(glue::glue(
+  '{Sys.getenv("MODELS_CONTAINER")}/src/{picked}/{picked}_y.R'
+))$value
 model_results <- model_fun(
   x.data = x_data,
   db.con = db_con,
+  y.fun = model_y_fun,
   cutoff.date = lubridate::ymd(Sys.getenv('MODEL_CUTOFF')),
   tune.initial = as.integer(Sys.getenv('MODEL_TUNE_INITIAL')),
   tune.iter = as.integer(Sys.getenv('MODEL_TUNE_ITER')),
