@@ -1,11 +1,11 @@
 pick_model <- function(
   models.dir,
   db.con,
-  models.table.name,
+  models.table.name
 ) {
   
-  # Initialized result
-  picked <- list()
+  # Initialize list that we'll return later
+  picked <- list(feature_hash = 'N/A')
   
   # Get a clean vector of models from the directory provided
   model_dirs_vec <- list.dirs(
@@ -22,11 +22,12 @@ pick_model <- function(
   # Retrain on fresh data with same features
   # Retrain model with a new feature set
   # Retrain with a tweaked feature set (searching for optima)
+  
   if(!DBI::dbExistsTable(db.con, models.table.name)) {
     
     message('No models table found, creating first model.')
-    picked_model <- sample(x = model_dirs_vec, size = 1)
-    picked_mode <- 'new'
+    picked$model <- sample(x = model_dirs_vec, size = 1)
+    picked$mode <- 'new'
     
   } else {
     
@@ -46,27 +47,43 @@ pick_model <- function(
     if(any(!model_dirs_vec %in% models_df$name)) {
       
       message(
-        'Models table exists, but not all have been created.',
+        'Models table exists, but not all have been created.\n',
         'Picking a random not-yet-created model.'
       )
-      models_not_yet <- model_dirs_vec[!model_dirs_vec %in% models_df$name]
-      picked <- sample(x = models_not_yet, size = 1)
-      mode <- 'new'
+      models_not_yet <- model_dirs_vec[
+        !model_dirs_vec %in% unique(models_df$name)
+      ]
+      picked$model <- sample(x = models_not_yet, size = 1)
+      picked$mode <- 'new'
       
     } else {
       
+      message(
+        'All models present in table',
+        'Picking mode.'
+      )
       # Determine whether to tweak, refresh, or try a new model
+      picked_df <- models_df |> 
+        slice_sample(n = 1)
       
+      picked$model <- picked_df$name
+      
+      picked$mode <- sample(
+        x = c('refresh, tweak, new'),
+        size = 1
+      )
+      
+      if(picked$mode != 'new') {
+        picked$feature_hash <- picked_df$feature_hash
+      }
       
     }
     
   }
   
-  
-  # Return result: a list of two strings
-  
-  picked$model <- picked_model
-  picked$mode <- picked_mode
+  message(paste('Picked model:', picked$model))
+  message(paste('Picked mode:', picked$mode))
+  message(paste('Picked feature hash:', picked$feature_hash))
   
   return(picked)
   

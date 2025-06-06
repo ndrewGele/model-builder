@@ -3,8 +3,21 @@
 library(dplyr)
 library(dbplyr)
 
-source(glue::glue('{Sys.getenv("COMMON_CODE_CONTAINER")}/src/get_all_data.R'))
-source('./src/pick_model.R')
+source(file.path(
+  Sys.getenv('COMMON_CODE_CONTAINER'),
+  'src',
+  'get_all_data.R'
+))
+source(file.path(
+  Sys.getenv('COMMON_CODE_CONTAINER'),
+  'src',
+  'feature_utils.R'
+))
+source(file.path(
+  '.', 
+  'src', 
+  'pick_model.R'
+))
 
 
 # Prerequisite Checks Before Running --------------------------------------
@@ -80,68 +93,136 @@ if(
   # Don't leave connection open while not using it
   DBI::dbDisconnect(db_con)
   stop('Missing one or more required tables. Stopping process.')
+} else {
+  message('Found all required tables.')
 }
+
+
+# Pick a Model and Decide how to Update -----------------------------------
+
+models_directory <- glue::glue('{Sys.getenv("MODELS_CONTAINER")}/src')
+picked <- pick_model(
+  models.dir = models_directory,
+  db.con = db_con,
+  models.table.name = 'models'
+)
+
+
+# Get Data ----------------------------------------------------------------
+
+message('Getting base training data.')
+df <- get_all_data(db.con = db_con)
+
+message('Checking for features.')
+if(
+  file.exists(
+    file.path(
+      Sys.getenv('MODELS_CONTAINER'),
+      'src',
+      picked$model,
+      glue::glue('{picked$model}_features.R')
+    )
+  )
+) {
+  
+  message('Features found, creating feature definition.')
+  feature_definition <- source(
+    file.path(
+      Sys.getenv('MODELS_CONTAINER'),
+      'src',
+      picked$model,
+      glue::glue('{picked$model}_features.R')
+    )
+  )$value
+  
+  message('Creating feature spec based on mode.')
+  if(picked$mode == 'new') {
+  
+    feature_spec <- generate_feature_spec(feature_definition)
+  
+  } else {
+    
+    message('Pulling previous feature spec from database.')
+    prev_feature_spec <- feature_table$feature_spec_string |>
+      jsonlite::fromJSON() |>
+      purrr::map(\(x) eval(parse(text = x)))
+    
+    if(picked$mode == 'refresh') {
+      message('Refreshing previous feature spec.')
+      feature_spec <- prev_feature_spec
+    }
+    
+    if(picked$mode == 'tweak') {
+      message('Tweaking previous feature spec.')
+      feature_spec <- tweak_feature_spec(prev_feature_spec, feature_definition)
+    }
+    
+  }
+  
+  feature_hash <- feature_spec |> 
+    names() |> 
+    sort() |>
+    rlang::hash() |> 
+    substr(1, 8)
+  
+  feature_spec_string <- feature_spec |> 
+    as.character() |> 
+    jsonlite::toJSON() |> 
+    as.character()
+  
+  features_df <- create_features(df, feature_spec)
+  df <- bind_cols(df, features_df)
+  
+}
+
+message('Pulling Y Data')
+
+model_y_fun <- source(file.path(
+  Sys.getenv("MODELS_CONTAINER"),
+  'src',
+  picked$model,
+  glue::glue('{picked$model}_y.R')
+))$value
+
+y_data <- model_y_fun(db.con = db_con)
+
+df <- inner_join(
+  y_data,
+  df,
+  by = c('symbol', 'date')
+) |> 
+  ungroup()
+
+message('Training data is ready.')
 
 
 # Multi-thread for Model Tuning -------------------------------------------
 
-cores_to_use <- parallelly::availableCores() /
+cores_to_use <-  as.numeric(parallelly::availableCores()) *
   as.numeric(Sys.getenv('MODEL_CORES_FRACTION'))
 
-cores_to_use |>
-  ceiling() |> 
-  max(1) |> 
-  parallelly::makeClusterPSOCK() |>
-  doParallel::registerDoParallel()
+# Ceiling() gets its own line because 
+# it was always returning the same as availableCores() for some reason??
+cores_to_use <- ceiling(cores_to_use)
 
-
-# Pick a Model, and Decide how to Update ----------------------------------
-
-models_directory <- glue::glue('{Sys.getenv("MODELS_CONTAINER")}/src')
-picked <- pick_model()
-
-
-# Pull Data and Create Model ----------------------------------------------
-
-
-# Pick a model to run, like how we picked symbols for other scripts
-
-
-message(glue::glue('Picked {picked} randomly from available models.'))
-
-
-
-
-message('Getting x_data.')
-x_data <- get_all_data(db.con = db_con)
-
-
-
-
-# Source Model Functions
-message('Running model functions.')
-if(exists(glue::glue(
-  '{Sys.getenv("MODELS_CONTAINER")}/src/{picked}/{picked}_features.R'
-))) {
-  
-  feat_instructions <- source(
-    glue::glue(
-      '{Sys.getenv("MODELS_CONTAINER")}/src/{picked}/{picked}_features.R'
-    )
-  )
-  
+if(cores_to_use > 1) {
+  library(future)
+  plan(multisession, workers = cores_to_use)
 }
 
-model_fun <- source(glue::glue(
-  '{Sys.getenv("MODELS_CONTAINER")}/src/{picked}/{picked}.R'
+
+# Run Model Training ------------------------------------------------------
+
+model_fun <- source(file.path(
+  Sys.getenv("MODELS_CONTAINER"),
+  'src',
+  picked$model,
+  glue::glue('{picked$model}.R')
 ))$value
-model_y_fun <- source(glue::glue(
-  '{Sys.getenv("MODELS_CONTAINER")}/src/{picked}/{picked}_y.R'
-))$value
+
+message('Starting model function.')
 model_results <- model_fun(
-  x.data = x_data,
-  db.con = db_con,
-  y.fun = model_y_fun,
+  data = df,
   cutoff.date = lubridate::ymd(Sys.getenv('MODEL_CUTOFF')),
   tune.initial = as.integer(Sys.getenv('MODEL_TUNE_INITIAL')),
   tune.iter = as.integer(Sys.getenv('MODEL_TUNE_ITER')),
@@ -150,16 +231,56 @@ model_results <- model_fun(
 message('Model function finished.')
 
 
-# Save Model Obj and Write Data -------------------------------------------
+# Save Feature and Model Data ---------------------------------------------
 
-# Use model function results to write model to S3
+# Feature Data
+message('Saving feature hash mapping to database.')
+feature_lookup_df <- data.frame(
+  feature_hash = feature_hash,
+  feature_spec_string = feature_spec_string
+)
+
+if(!DBI::dbExistsTable(db_con, 'features_lookup')) {
+  feature_lookup_df |> 
+    DBI::dbCreateTable(
+      conn = db_con,
+      name = 'features_lookup',
+      fields = _
+    )
+  message('Features table created.')
+} 
+
+existing_features_df <- db_con |> 
+  tbl('features_lookup') |> 
+  distinct() |> 
+  collect()
+
+feature_lookup_df <- feature_lookup_df |> 
+  anti_join(
+    existing_features_df,
+    by = 'feature_hash'
+  )
+
+if(nrow(feature_lookup_df) > 0) {
+  feature_lookup_df |> 
+    DBI::dbAppendTable(
+      conn = db_con,
+      name = 'features_lookup',
+      value = _
+    )
+  message('Feature data written to feature lookup table.')
+} else {
+  message('No new feature data to write to database.')
+}
+
+# Write model object to S3
 message('Parsing model results to save model objects.')
 purrr::walk(
   .x = model_results,
   .f = function(x) {
-    model_file_name <- glue::glue('{x$model_name}_{x$model_hash}.RDS')
     
-    tmp <- tempfile(pattern = x$model_hash)
+    tmp <- tempfile()
+    
     saveRDS(
       object = x$model_obj |> 
         butcher::axe_call() |>
@@ -171,13 +292,20 @@ purrr::walk(
     s3$put_object(
       Body = tmp,
       Bucket = Sys.getenv('SEAWEED_MODEL_BUCKET'),
-      Key = model_file_name
+      Key = paste0(
+        x$model_name, '_',
+        x$model_recipe, '_',
+        x$model_engine, '_',
+        feature_hash,
+        '.RDS'
+      )
     )
+    
   }
 )
 message('Model objects saved.')
 
-# Use model function results to create database record
+# Write model metadata to database
 message('Parsing model results to write metadata to database.')
 model_results_df <- purrr::map_dfr(
   .x = model_results,
@@ -185,11 +313,17 @@ model_results_df <- purrr::map_dfr(
     data.frame(
       name = x$model_name,
       recipe = x$model_recipe,
-      model = x$model_model,
-      feature_hash = x$feature_hash,
+      engine = x$model_engine,
+      feature_hash = feature_hash,
       training_perf = x$model_training_perf,
       holdout_perf = x$model_holdout_perf,
-      file_name = glue::glue('{x$model_name}_{x$feature_hash}.RDS'),
+      file_name = paste0(
+        x$model_name, '_',
+        x$model_recipe, '_',
+        x$model_engine, '_',
+        feature_hash,
+        '.RDS'
+      ),
       operation = picked$mode,
       update_timestamp = Sys.time()
     )
@@ -201,7 +335,7 @@ if(!DBI::dbExistsTable(db_con, 'models')) {
     DBI::dbCreateTable(
       conn = db_con,
       name = 'models',
-      fields = .
+      fields = _
     )
   message('Models table created.')
 }
@@ -210,57 +344,13 @@ model_results_df |>
   DBI::dbAppendTable(
     conn = db_con,
     name = 'models',
-    value = .
+    value = _
   )
 message('Results written to models table.')
 
 
-# Write feature data to feature lookup table
-message('Parsing features.')
-features_df <- purrr::map_dfr(
-  .x = model_results,
-  .f = function(x) {
-    data.frame(
-      feature_hash = x$feature_hash,
-      feature_spec = test_tweaked_spec |> 
-        as.character() |> 
-        jsonlite::toJSON() |> 
-        as.character()
-    )
-  }
-) |> 
-  distinct()
+# End Process -------------------------------------------------------------
 
-if(!DBI::dbExistsTable(db_con, 'features_lookup')) {
-  features_df |> 
-    DBI::dbCreateTable(
-      conn = db_con,
-      name = 'features_lookup',
-      fields = .
-    )
-  message('Feature lookup table created.')
-}
-
-existing_features_df <- db_con |> 
-  tbl('features_lookup') |> 
-  distinct()
-
-features_to_write <- features_df |> 
-  anti_join(
-    existing_features_df,
-    by = 'feature_hash'
-  )
-
-features_to_write |> 
-  DBI::dbAppendTable(
-    conn = db_con,
-    name = 'features_lookup',
-    value = .
-  )
-message('Feature data written to feature lookup table.')
-
-
-# End Process
 DBI::dbDisconnect(db_con)
 
 message('Process completed. Sleeping for two hours to cool down.')
