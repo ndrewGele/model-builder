@@ -69,7 +69,7 @@ pick_model <- function(
       picked$model <- picked_df$name
       
       picked$mode <- sample(
-        x = c('refresh, tweak, new'),
+        x = c('refresh', 'tweak', 'new'),
         size = 1
       )
       
