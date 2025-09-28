@@ -143,7 +143,15 @@ if(
   } else {
     
     message('Pulling previous feature spec from database.')
-    prev_feature_spec <- feature_table$feature_spec_string |>
+    
+    existing_features_df <- db_con |> 
+      tbl('features_lookup') |> 
+      filter(model_name == !!picked$model) |> 
+      collect()
+    
+    prev_feature_spec <- existing_features_df |> 
+      pull(feature_spec_string) |> 
+      sample(size = 1) |> 
       jsonlite::fromJSON() |>
       purrr::map(\(x) eval(parse(text = x)))
     
