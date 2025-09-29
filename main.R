@@ -168,7 +168,8 @@ if(
   }
   
   feature_hash <- feature_spec |> 
-    names() |> 
+    purrr::map(purrr::pluck, 'name') |> 
+    unlist() |>
     sort() |>
     rlang::hash() |> 
     substr(1, 8)
